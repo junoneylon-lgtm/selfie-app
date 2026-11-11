@@ -26,6 +26,18 @@
     object-fit: cover; transform: scaleX(-1);
   }
   #flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; transition: opacity .3s; }
+  #hud {
+    position: absolute; top: 12px; left: 12px; right: 12px; display: flex; justify-content: space-between;
+    font-size: 26px; font-weight: 800; text-shadow: 0 2px 6px #000; pointer-events: none;
+  }
+  #score::before { content: "🍕 "; }
+  #timer::before { content: "⏱ "; }
+  #gameover {
+    position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+    background: rgba(0,0,0,.65); text-align: center; font-size: 20px;
+  }
+  #gameover h2 { margin: 0 0 8px; font-size: 40px; color: var(--accent); }
+  [hidden] { display: none !important; }
   .controls { display: flex; gap: 12px; margin: 18px 0; flex-wrap: wrap; justify-content: center; align-items: center; }
   button {
     font: inherit; font-weight: 700; border: 0; border-radius: 999px;
@@ -49,12 +61,21 @@
     <video id="video" playsinline muted></video>
     <canvas id="overlay"></canvas>
     <div id="flash"></div>
+    <div id="hud" hidden><span id="score">0</span><span id="timer">45</span></div>
+    <div id="gameover" hidden>
+      <h2>Game over!</h2>
+      <p id="final"></p>
+      <button id="again">Play again</button>
+    </div>
   </div>
 
   <div class="controls">
     <button id="start">Start camera</button>
     <button id="snap" title="Take a photo" disabled>📸</button>
+    <button id="play" disabled>Play Snack Attack 🎮</button>
     <label><input type="checkbox" id="ears" checked> Dog ears 🐶</label>
+    <label><input type="checkbox" id="nose" checked> Clown nose 🤡</label>
+    <label><input type="checkbox" id="music" checked> Music 🎵</label>
     <label><input type="checkbox" id="easy"> Easy mode (open mouth = tongue)</label>
   </div>
 
@@ -76,6 +97,14 @@ const sctx = sampler.getContext("2d", { willReadFrequently: true });
 const statusEl = document.getElementById("status");
 const easy = document.getElementById("easy");
 const ears = document.getElementById("ears");
+const noseBox = document.getElementById("nose");
+const playBtn = document.getElementById("play");
+const hud = document.getElementById("hud");
+const gameOverEl = document.getElementById("gameover");
+
+let game = null;
+let mouth = null;
+let tongueTip = null;
 const startBtn = document.getElementById("start");
 const snapBtn = document.getElementById("snap");
 
@@ -120,6 +149,7 @@ startBtn.onclick = async () => {
 
     startBtn.style.display = "none";
     snapBtn.disabled = false;
+    playBtn.disabled = false;
     setStatus("Stick out your tongue! 👅");
     requestAnimationFrame(loop);
   } catch (err) {
@@ -170,13 +200,21 @@ function loop(now) {
       const signal = Math.max(ai, pink, easy.checked ? jaw * 1.5 : 0);
       if (signal > 0.35) target = 1;
 
+      const mid = { x: (lm[13].x + lm[14].x) / 2, y: (lm[13].y + lm[14].y) / 2 };
+      const mouthW = Math.hypot(lm[291].x - lm[61].x, lm[291].y - lm[61].y);
+      mouth = { ...mid, r: mouthW * 1.5, open: jaw > 0.12 };
+      tongueTip = null;
+
       if (ears.checked) drawEars(lm, now);
+      if (noseBox.checked) drawNose(lm);
 
       amount += (target - amount) * 0.18;
       if (amount > 0.02) drawTongue(lm, amount, now);
     } else {
       amount = 0;
+      mouth = tongueTip = null;
     }
+    if (game) updateGame(now);
   }
   requestAnimationFrame(loop);
 }
@@ -252,6 +290,7 @@ function drawTongue(lm, amt, t) {
   ctx.closePath();
 
   const [tx, ty] = P(L, 0);
+  if (amt > 0.5) tongueTip = { x: tx, y: ty, r: w * 0.9 };
   const grad = ctx.createLinearGradient(o.x, o.y, tx, ty);
   grad.addColorStop(0, "#b0123f");
   grad.addColorStop(0.35, "#ff5c8a");
@@ -278,6 +317,155 @@ function drawTongue(lm, amt, t) {
   ctx.stroke();
   ctx.restore();
 }
+
+function drawNose(lm) {
+  const { faceW } = faceFrame(lm);
+  const n = lm[1];
+  const r = faceW * 0.11;
+  const g = ctx.createRadialGradient(n.x - r * 0.3, n.y - r * 0.3, r * 0.1, n.x, n.y, r);
+  g.addColorStop(0, "#ff6b6b");
+  g.addColorStop(0.7, "#e00000");
+  g.addColorStop(1, "#8a0000");
+  ctx.beginPath();
+  ctx.arc(n.x, n.y, r, 0, Math.PI * 2);
+  ctx.fillStyle = g;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(n.x - r * 0.35, n.y - r * 0.4, r * 0.25, r * 0.15, -0.6, 0, Math.PI * 2);
+  ctx.fillStyle = "rgba(255,255,255,0.7)";
+  ctx.fill();
+}
+
+// ---------- Snack Attack game ----------
+const ROUND_MS = 45000;
+const GOOD = ["🍕", "🍩", "🍓", "🍔", "🍪", "🍌", "🧁"];
+const BAD = ["🌶️"];
+const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+function loadBest() {
+  try { return Number(localStorage.getItem("snackBest")) || 0; } catch { return 0; }
+}
+
+function startGame() {
+  game = { start: performance.now(), last: performance.now(), score: 0, snacks: 0, items: [], pops: [], nextSpawn: 0 };
+  startMusic();
+  gameOverEl.hidden = true;
+  hud.hidden = false;
+  playBtn.disabled = true;
+}
+
+function endGame() {
+  const best = Math.max(game.score, loadBest());
+  try { localStorage.setItem("snackBest", best); } catch {}
+  document.getElementById("final").textContent =
+    `You ate ${game.snacks} snacks — score ${game.score}! 🏆 Best: ${best}`;
+  stopMusic();
+  sfxEnd();
+  game = null;
+  hud.hidden = true;
+  gameOverEl.hidden = false;
+  playBtn.disabled = false;
+}
+
+// Text must be flipped back because the whole canvas is mirrored like a selfie.
+function drawText(text, x, y, size, color = "#fff") {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(-1, 1);
+  ctx.font = `bold ${size}px system-ui, "Apple Color Emoji", sans-serif`;
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  ctx.fillStyle = color;
+  ctx.fillText(text, 0, 0);
+  ctx.restore();
+}
+
+function updateGame(now) {
+  const W = canvas.width, H = canvas.height;
+  const dt = Math.min(50, now - game.last) / 1000;
+  game.last = now;
+  const elapsed = now - game.start;
+  const progress = elapsed / ROUND_MS;
+  if (elapsed >= ROUND_MS) return endGame();
+
+  if (now >= game.nextSpawn) {
+    const bad = Math.random() < 0.2;
+    game.items.push({
+      x: W * (0.12 + Math.random() * 0.76), y: -30,
+      vy: H * (0.25 + 0.35 * progress) * (0.8 + Math.random() * 0.4),
+      emoji: bad ? pick(BAD) : pick(GOOD), bad,
+    });
+    game.nextSpawn = now + 900 - 450 * progress;
+  }
+
+  for (const it of game.items) {
+    it.y += it.vy * dt;
+    const eaten = (mouth && mouth.open && dist(it, mouth) < mouth.r) ||
+                  (tongueTip && dist(it, tongueTip) < tongueTip.r);
+    if (eaten) {
+      it.done = true;
+      if (it.bad) { game.score -= 1; sfxChilli(); } else { game.score += 1; game.snacks += 1; sfxChomp(); }
+      game.pops.push({ x: it.x, y: it.y, t: now, text: it.bad ? "-1 🔥" : "+1", color: it.bad ? "#ff4d4d" : "#fffc00" });
+    }
+    if (it.y > H + 40) it.done = true;
+  }
+  game.items = game.items.filter((it) => !it.done);
+  game.pops = game.pops.filter((p) => now - p.t < 800);
+
+  for (const it of game.items) drawText(it.emoji, it.x, it.y, W * 0.08);
+  for (const p of game.pops) {
+    const age = (now - p.t) / 800;
+    ctx.globalAlpha = 1 - age;
+    drawText(p.text, p.x, p.y - age * 60, W * 0.06, p.color);
+    ctx.globalAlpha = 1;
+  }
+
+  document.getElementById("score").textContent = game.score;
+  document.getElementById("timer").textContent = Math.ceil((ROUND_MS - elapsed) / 1000);
+}
+
+// ---------- Music and sound effects, made with the Web Audio API ----------
+let audio = null;
+let musicTimer = null;
+const MELODY = [72, 76, 79, 76, 74, 77, 81, 77, 72, 76, 79, 84, 83, 79, 77, 74];
+const BASS = [48, 48, 53, 53, 50, 50, 55, 55];
+const hz = (midi) => 440 * 2 ** ((midi - 69) / 12);
+
+function beep(freq, dur, type = "square", vol = 0.06, delay = 0) {
+  const when = audio.currentTime + delay;
+  const osc = audio.createOscillator();
+  const gain = audio.createGain();
+  osc.type = type;
+  osc.frequency.setValueAtTime(freq, when);
+  gain.gain.setValueAtTime(vol, when);
+  gain.gain.exponentialRampToValueAtTime(0.001, when + dur);
+  osc.connect(gain).connect(audio.destination);
+  osc.start(when);
+  osc.stop(when + dur);
+}
+
+function startMusic() {
+  audio ??= new AudioContext();
+  audio.resume();
+  stopMusic();
+  let step = 0;
+  musicTimer = setInterval(() => {
+    if (document.getElementById("music").checked) {
+      beep(hz(MELODY[step % MELODY.length]), 0.16, "square", 0.04);
+      if (step % 2 === 0) beep(hz(BASS[(step / 2) % BASS.length]), 0.3, "triangle", 0.12);
+    }
+    step++;
+  }, 170);
+}
+
+function stopMusic() { clearInterval(musicTimer); }
+const sfxChomp = () => { beep(500, 0.07, "square", 0.08); beep(900, 0.09, "square", 0.08, 0.06); };
+const sfxChilli = () => beep(110, 0.35, "sawtooth", 0.12);
+const sfxEnd = () => [72, 76, 79, 84].forEach((m, i) => beep(hz(m), 0.25, "square", 0.07, i * 0.15));
+
+playBtn.onclick = startGame;
+document.getElementById("again").onclick = startGame;
 
 snapBtn.onclick = () => {
   const out = document.createElement("canvas");
