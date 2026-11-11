@@ -1,0 +1,306 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Tongue Cam</title>
+<style>
+  :root { --bg: #121212; --fg: #fff; --accent: #fffc00; --muted: #9a9a9a; --panel: #1e1e1e; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font-family: system-ui, -apple-system, sans-serif;
+    display: flex; flex-direction: column; align-items: center;
+    min-height: 100vh; padding: 0 16px 32px;
+  }
+  h1 { margin: 20px 0 4px; font-size: 32px; }
+  h1 span { color: var(--accent); }
+  #status { color: var(--muted); margin: 0 0 14px; min-height: 1.3em; text-align: center; }
+  .stage {
+    position: relative; width: min(640px, 100%); aspect-ratio: 4 / 3;
+    border-radius: 24px; overflow: hidden; background: #000;
+    box-shadow: 0 10px 40px rgba(0,0,0,.6);
+  }
+  .stage video, .stage canvas {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; transform: scaleX(-1);
+  }
+  #flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; transition: opacity .3s; }
+  .controls { display: flex; gap: 12px; margin: 18px 0; flex-wrap: wrap; justify-content: center; align-items: center; }
+  button {
+    font: inherit; font-weight: 700; border: 0; border-radius: 999px;
+    padding: 12px 24px; cursor: pointer; background: var(--accent); color: #000;
+  }
+  button:disabled { opacity: .4; cursor: default; }
+  #snap { width: 64px; height: 64px; padding: 0; font-size: 28px; background: transparent; border: 5px solid #fff; color: #fff; }
+  label { color: var(--muted); display: flex; gap: 6px; align-items: center; cursor: pointer; }
+  .meters { width: min(640px, 100%); background: var(--panel); border-radius: 16px; padding: 14px 18px; font-size: 14px; }
+  .meter { display: grid; grid-template-columns: 140px 1fr 44px; gap: 10px; align-items: center; margin: 6px 0; }
+  .bar { height: 10px; background: #333; border-radius: 5px; overflow: hidden; }
+  .bar div { height: 100%; width: 0; background: var(--accent); transition: width .1s; }
+  .hint { color: var(--muted); font-size: 13px; margin-top: 8px; }
+</style>
+</head>
+<body>
+  <h1>Tongue <span>Cam</span> 👅</h1>
+  <p id="status">Press Start to turn on your camera.</p>
+
+  <div class="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="overlay"></canvas>
+    <div id="flash"></div>
+  </div>
+
+  <div class="controls">
+    <button id="start">Start camera</button>
+    <button id="snap" title="Take a photo" disabled>📸</button>
+    <label><input type="checkbox" id="ears" checked> Dog ears 🐶</label>
+    <label><input type="checkbox" id="easy"> Easy mode (open mouth = tongue)</label>
+  </div>
+
+  <div class="meters">
+    <div class="meter"><span>Mouth open</span><div class="bar"><div id="m-jaw"></div></div><span id="v-jaw">0</span></div>
+    <div class="meter"><span>Pink in mouth</span><div class="bar"><div id="m-pink"></div></div><span id="v-pink">0</span></div>
+    <div class="meter"><span>AI "tongueOut"</span><div class="bar"><div id="m-ai"></div></div><span id="v-ai">0</span></div>
+    <div class="hint">The tongue appears when any signal passes 0.35. Press <b>T</b> to force it on for testing.</div>
+  </div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("overlay");
+const ctx = canvas.getContext("2d");
+const sampler = document.createElement("canvas");
+const sctx = sampler.getContext("2d", { willReadFrequently: true });
+const statusEl = document.getElementById("status");
+const easy = document.getElementById("easy");
+const ears = document.getElementById("ears");
+const startBtn = document.getElementById("start");
+const snapBtn = document.getElementById("snap");
+
+let landmarker;
+let amount = 0;
+let forced = false;
+let lastVideoTime = -1;
+
+const setStatus = (t) => (statusEl.textContent = t);
+const clamp01 = (v) => Math.max(0, Math.min(1, v));
+
+function setMeter(id, value) {
+  document.getElementById("m-" + id).style.width = (clamp01(value) * 100) + "%";
+  document.getElementById("v-" + id).textContent = value.toFixed(2);
+}
+
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  try {
+    setStatus("Loading the face tracker…");
+    const files = await FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+    );
+    landmarker = await FaceLandmarker.createFromOptions(files, {
+      baseOptions: {
+        modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
+        delegate: "GPU",
+      },
+      runningMode: "VIDEO",
+      numFaces: 1,
+      outputFaceBlendshapes: true,
+    });
+
+    setStatus("Starting the camera…");
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: 640, height: 480, facingMode: "user" }, audio: false,
+    });
+    video.srcObject = stream;
+    await video.play();
+    canvas.width = sampler.width = video.videoWidth;
+    canvas.height = sampler.height = video.videoHeight;
+
+    startBtn.style.display = "none";
+    snapBtn.disabled = false;
+    setStatus("Stick out your tongue! 👅");
+    requestAnimationFrame(loop);
+  } catch (err) {
+    console.error(err);
+    setStatus("Oops: " + err.message);
+    startBtn.disabled = false;
+  }
+};
+
+// How much of the gap between the lips is tongue-coloured (pink/red, not dark or white teeth).
+function pinkness(lm) {
+  const top = lm[13], bot = lm[14];
+  const mouthW = Math.hypot(lm[308].x - lm[78].x, lm[308].y - lm[78].y);
+  const cx = (top.x + bot.x) / 2;
+  const x0 = Math.max(0, Math.floor(cx - mouthW * 0.25));
+  const y0 = Math.max(0, Math.floor(top.y));
+  const w = Math.floor(mouthW * 0.5);
+  const h = Math.floor(bot.y - top.y);
+  if (w < 4 || h < 4) return 0;
+
+  sctx.drawImage(video, 0, 0);
+  const { data } = sctx.getImageData(x0, y0, w, h);
+  let hits = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const r = data[i], g = data[i + 1], b = data[i + 2];
+    if (r > 70 && r > g * 1.4 && r > b * 1.15) hits++;
+  }
+  return clamp01((hits / (data.length / 4)) * 1.6);
+}
+
+function loop(now) {
+  if (video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, now);
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    let target = forced ? 1 : 0;
+    if (res.faceLandmarks.length) {
+      const lm = res.faceLandmarks[0].map((p) => ({ x: p.x * canvas.width, y: p.y * canvas.height }));
+      const shapes = Object.fromEntries(res.faceBlendshapes[0].categories.map((c) => [c.categoryName, c.score]));
+      const jaw = shapes.jawOpen ?? 0;
+      const ai = shapes.tongueOut ?? 0;
+      const pink = jaw > 0.1 ? pinkness(lm) : 0;
+      setMeter("jaw", jaw);
+      setMeter("pink", pink);
+      setMeter("ai", ai);
+
+      const signal = Math.max(ai, pink, easy.checked ? jaw * 1.5 : 0);
+      if (signal > 0.35) target = 1;
+
+      if (ears.checked) drawEars(lm, now);
+
+      amount += (target - amount) * 0.18;
+      if (amount > 0.02) drawTongue(lm, amount, now);
+    } else {
+      amount = 0;
+    }
+  }
+  requestAnimationFrame(loop);
+}
+
+// "down" and "sideways" directions for this face, so drawings follow head tilt
+function faceFrame(lm) {
+  let dx = lm[152].x - lm[10].x, dy = lm[152].y - lm[10].y;
+  const faceH = Math.hypot(dx, dy);
+  dx /= faceH; dy /= faceH;
+  const faceW = Math.hypot(lm[454].x - lm[234].x, lm[454].y - lm[234].y);
+  return { dx, dy, px: -dy, py: dx, faceH, faceW };
+}
+
+function drawEars(lm, t) {
+  const { dx, dy, px, py, faceH, faceW } = faceFrame(lm);
+  const upAngle = Math.atan2(-dy, -dx);
+  const E = faceH * 0.6;
+  const W = faceW * 0.32;
+
+  for (const s of [1, -1]) {
+    const bx = lm[10].x - dx * faceH * 0.02 + px * s * faceW * 0.36;
+    const by = lm[10].y - dy * faceH * 0.02 + py * s * faceW * 0.36;
+    const wiggle = Math.sin(t / 250 + s) * 0.08;
+
+    ctx.save();
+    ctx.translate(bx, by);
+    ctx.rotate(upAngle - s * (0.55 + wiggle));
+
+    const ear = (len, wid) => {
+      ctx.beginPath();
+      ctx.moveTo(0, -wid * 0.3);
+      ctx.bezierCurveTo(len * 0.3, -wid * 0.7, len, -wid * 0.6, len, 0);
+      ctx.bezierCurveTo(len, wid * 0.6, len * 0.3, wid * 0.7, 0, wid * 0.3);
+      ctx.closePath();
+    };
+
+    ear(E, W);
+    ctx.fillStyle = "#8b5a2b";
+    ctx.fill();
+    ctx.lineWidth = W * 0.06;
+    ctx.strokeStyle = "#4e3015";
+    ctx.stroke();
+
+    ctx.translate(E * 0.12, 0);
+    ear(E * 0.72, W * 0.55);
+    ctx.fillStyle = "#f4a6b8";
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+function drawTongue(lm, amt, t) {
+  const top = lm[13], bot = lm[14];
+  const o = { x: (top.x + bot.x) / 2, y: (top.y + bot.y) / 2 };
+  const { dx, dy, px, py, faceH } = faceFrame(lm);
+
+  const mouthW = Math.hypot(lm[291].x - lm[61].x, lm[291].y - lm[61].y);
+  const w = mouthW * 0.8;
+  const L = faceH * 1.3 * amt;
+  const sway = Math.sin(t / 160) * w * 0.45 * amt;
+
+  const P = (u, v) => {
+    const s = sway * (u / L) ** 2;
+    return [o.x + dx * u + px * (v + s), o.y + dy * u + py * (v + s)];
+  };
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.moveTo(...P(0, w / 2));
+  ctx.bezierCurveTo(...P(L * 0.4, w * 0.6), ...P(L * 0.8, w * 0.65), ...P(L * 0.95, w * 0.38));
+  ctx.bezierCurveTo(...P(L * 1.06, w * 0.15), ...P(L * 1.06, -w * 0.15), ...P(L * 0.95, -w * 0.38));
+  ctx.bezierCurveTo(...P(L * 0.8, -w * 0.65), ...P(L * 0.4, -w * 0.6), ...P(0, -w / 2));
+  ctx.closePath();
+
+  const [tx, ty] = P(L, 0);
+  const grad = ctx.createLinearGradient(o.x, o.y, tx, ty);
+  grad.addColorStop(0, "#b0123f");
+  grad.addColorStop(0.35, "#ff5c8a");
+  grad.addColorStop(1, "#ff8fab");
+  ctx.fillStyle = grad;
+  ctx.fill();
+  ctx.lineWidth = w * 0.05;
+  ctx.strokeStyle = "#7a0026";
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(...P(L * 0.08, 0));
+  ctx.quadraticCurveTo(...P(L * 0.45, 0), ...P(L * 0.78, 0));
+  ctx.lineWidth = w * 0.06;
+  ctx.lineCap = "round";
+  ctx.strokeStyle = "rgba(140, 0, 45, 0.55)";
+  ctx.stroke();
+
+  ctx.beginPath();
+  ctx.moveTo(...P(L * 0.3, w * 0.32));
+  ctx.quadraticCurveTo(...P(L * 0.55, w * 0.42), ...P(L * 0.75, w * 0.3));
+  ctx.lineWidth = w * 0.07;
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.35)";
+  ctx.stroke();
+  ctx.restore();
+}
+
+snapBtn.onclick = () => {
+  const out = document.createElement("canvas");
+  out.width = canvas.width;
+  out.height = canvas.height;
+  const o = out.getContext("2d");
+  o.translate(out.width, 0);
+  o.scale(-1, 1);
+  o.drawImage(video, 0, 0);
+  o.drawImage(canvas, 0, 0);
+
+  const a = document.createElement("a");
+  a.download = "tongue-cam.png";
+  a.href = out.toDataURL("image/png");
+  a.click();
+
+  const flash = document.getElementById("flash");
+  flash.style.transition = "none";
+  flash.style.opacity = 1;
+  requestAnimationFrame(() => { flash.style.transition = "opacity .4s"; flash.style.opacity = 0; });
+};
+
+addEventListener("keydown", (e) => { if (e.key.toLowerCase() === "t") forced = !forced; });
+</script>
+</body>
+</html>
